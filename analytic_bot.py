@@ -26,8 +26,8 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "8660442841:AAEOXjIzvJA3xSKh0DHi_V9jLXeEshO2L2k")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1024188205")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "Your_Bot_Token_Here")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "Your_Chat_ID_Here")
 
 # Default contracts yang bisa langsung dianalisis
 PRESET_CONTRACTS = {
