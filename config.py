@@ -10,10 +10,10 @@ import os
 # API KEYS — set via environment variable
 # Jangan pernah hardcode di sini!
 # ─────────────────────────────────────────────
-ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "AW8AJ3TQV79VTM1WM9KY7W9H5ICZZ1WUYT")
-INFURA_URL        = os.getenv("INFURA_URL",        "https://mainnet.infura.io/v3/e1576449bd6142eba99fd3cc4f3fe7b3")
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN",    "8660442841:AAEOXjIzvJA3xSKh0DHi_V9jLXeEshO2L2k")
-TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID",  "1024188205")
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "Your_Etherscan_Api_Key_Here")
+INFURA_URL        = os.getenv("INFURA_URL",        "https://mainnet.infura.io/v3/Your_Infura_Api_Key_Here")
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN",    "Your_Bot_token_Here")
+TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID",  "Your_Chat_ID_Here")
 
 # ─────────────────────────────────────────────
 # NETWORK CONFIG
