@@ -43,8 +43,8 @@ except Exception as e:
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-TELEGRAM_TOKEN   = "8660442841:AAE1oCT6WkyhVdE9eC46I-YOD-FNBjeomYY"  
-ADMIN_CHAT_ID    = "1024188205"   # Rizal — admin only
+TELEGRAM_TOKEN   = "Your_Bot_Token_Telegram"  
+ADMIN_CHAT_ID    = "Your_Chat_ID"   # Rizal — admin only
 USDT_TRC20       = "TNxivKGm18XCYtgM2TMewNompRnBqfPjFY"
 
 PRESET_CONTRACTS = {
