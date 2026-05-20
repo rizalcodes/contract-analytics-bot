@@ -1,7 +1,7 @@
 """
-analytic_bot.py - Contract Analytics + Subscription Bot
+analytic_bot.py - Contract Analytics + Subscription + Portfolio Tracker Bot
 Web3 Python Toolkit by Rizal
-All-in-one: analytics commands + subscription/payment management
+All-in-one: analytics + subscription/payment + portfolio tracking
 """
 
 import os
@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import Counter
+from web3 import Web3
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -43,7 +44,7 @@ except Exception as e:
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-TELEGRAM_TOKEN   = "8660442841:AAE1oCT6WkyhVdE9eC46I-YOD-FNBjeomYY"  
+TELEGRAM_TOKEN   = "8660442841:AAE1oCT6WkyhVdE9eC46I-YOD-FNBjeomYY"
 ADMIN_CHAT_ID    = "1024188205"   # Rizal — admin only
 USDT_TRC20       = "TNxivKGm18XCYtgM2TMewNompRnBqfPjFY"
 
@@ -70,6 +71,150 @@ PLANS = {
 }
 
 DB_FILE = "subscribers.json"
+
+
+# ─────────────────────────────────────────────
+# PORTFOLIO TRACKER CLASSES
+# ─────────────────────────────────────────────
+class PriceClient:
+    BASE = "https://api.coingecko.com/api/v3"
+
+    def __init__(self):
+        self.session   = requests.Session()
+        self._cache    = {}
+        self._cache_ts = {}
+
+    def get_eth_price(self) -> float:
+        try:
+            now = time.time()
+            if "eth" in self._cache and now - self._cache_ts.get("eth", 0) < 300:
+                return self._cache["eth"]
+            r = self.session.get(
+                f"{self.BASE}/simple/price",
+                params={"ids": "ethereum", "vs_currencies": "usd"},
+                timeout=10
+            )
+            price = r.json().get("ethereum", {}).get("usd", 0)
+            self._cache["eth"] = price
+            self._cache_ts["eth"] = now
+            return price
+        except Exception:
+            return 0
+
+    def get_token_price(self, contract_address: str) -> float:
+        try:
+            r = self.session.get(
+                f"{self.BASE}/simple/token_price/ethereum",
+                params={"contract_addresses": contract_address.lower(), "vs_currencies": "usd"},
+                timeout=10
+            )
+            return r.json().get(contract_address.lower(), {}).get("usd", 0)
+        except Exception:
+            return 0
+
+
+class PortfolioEtherscan:
+    BASE = "https://api.etherscan.io/v2/api"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.session = requests.Session()
+
+    def _get(self, params: dict) -> dict:
+        params["apikey"]  = self.api_key
+        params["chainid"] = 1
+        try:
+            r = self.session.get(self.BASE, params=params, timeout=15)
+            return r.json()
+        except Exception:
+            return {}
+
+    def get_eth_balance(self, address: str) -> float:
+        data = self._get({"module": "account", "action": "balance", "address": address, "tag": "latest"})
+        try:
+            return int(data.get("result", 0)) / 1e18
+        except Exception:
+            return 0
+
+    def get_token_balances(self, address: str) -> list:
+        data = self._get({"module": "account", "action": "tokentx", "address": address, "sort": "desc"})
+        txs  = data.get("result", [])
+        if not isinstance(txs, list):
+            return []
+        tokens = {}
+        for tx in txs:
+            contract = tx.get("contractAddress", "").lower()
+            decimals = int(tx.get("tokenDecimal", 18))
+            value    = int(tx.get("value", 0))
+            if contract not in tokens:
+                tokens[contract] = {"symbol": tx.get("tokenSymbol",""), "name": tx.get("tokenName",""), "contract": contract, "decimals": decimals, "balance": 0}
+            if tx.get("to","").lower() == address.lower():
+                tokens[contract]["balance"] += value
+            elif tx.get("from","").lower() == address.lower():
+                tokens[contract]["balance"] -= value
+        result = []
+        for contract, d in tokens.items():
+            bal = d["balance"] / (10 ** d["decimals"])
+            if bal > 0:
+                result.append({**d, "balance": round(bal, 6)})
+        return result
+
+    def get_nft_holdings(self, address: str) -> list:
+        data = self._get({"module": "account", "action": "tokennfttx", "address": address, "sort": "desc"})
+        txs  = data.get("result", [])
+        if not isinstance(txs, list):
+            return []
+        nfts = {}
+        for tx in txs:
+            key = f"{tx.get('contractAddress','').lower()}_{tx.get('tokenID','')}"
+            if tx.get("to","").lower() == address.lower():
+                nfts[key] = {"name": tx.get("tokenName",""), "symbol": tx.get("tokenSymbol",""), "token_id": tx.get("tokenID","")}
+            elif tx.get("from","").lower() == address.lower() and key in nfts:
+                del nfts[key]
+        return list(nfts.values())
+
+
+class PortfolioAnalyzer:
+    def __init__(self, etherscan_key: str, infura_url: str):
+        self.etherscan = PortfolioEtherscan(etherscan_key)
+        self.prices    = PriceClient()
+        self.w3        = Web3(Web3.HTTPProvider(infura_url))
+
+    def analyze(self, address: str) -> dict:
+        log.info(f"💼 Analyzing portfolio: {address[:10]}...")
+        try:
+            eth_bal   = float(self.w3.eth.get_balance(Web3.to_checksum_address(address))) / 1e18
+        except Exception:
+            eth_bal   = self.etherscan.get_eth_balance(address)
+        eth_price = self.prices.get_eth_price()
+        eth_value = eth_bal * eth_price
+
+        tokens = self.etherscan.get_token_balances(address)
+        token_total = 0
+        for t in tokens[:20]:
+            price = self.prices.get_token_price(t["contract"])
+            t["price_usd"] = price
+            t["value_usd"] = round(t["balance"] * price, 2)
+            token_total += t["value_usd"]
+        tokens = sorted(tokens, key=lambda x: x.get("value_usd", 0), reverse=True)
+
+        nfts        = self.etherscan.get_nft_holdings(address)
+        total_value = eth_value + token_total
+
+        return {
+            "address"  : address,
+            "timestamp": datetime.now().isoformat(),
+            "eth"      : {"balance": round(eth_bal, 6), "price_usd": eth_price, "value_usd": round(eth_value, 2)},
+            "tokens"   : tokens,
+            "nfts"     : nfts,
+            "summary"  : {
+                "total_value_usd": round(total_value, 2),
+                "eth_value"      : round(eth_value, 2),
+                "token_value"    : round(token_total, 2),
+                "nft_count"      : len(nfts),
+                "token_count"    : len(tokens),
+            }
+        }
 
 
 # ─────────────────────────────────────────────
@@ -192,10 +337,17 @@ class AnalyticsBot:
         self.running  = True
 
         # Analytics state per user
-        self.analytics     = {}   # chat_id → ContractAnalytics
-        self.active_contract = {}  # chat_id → address
-        self.alert_enabled = {}   # chat_id → bool
-        self.monitor_thread = None
+        self.analytics        = {}
+        self.active_contract  = {}
+        self.alert_enabled    = {}
+        self.monitor_thread   = None
+
+        # Portfolio tracker state
+        self.portfolio_analyzer = PortfolioAnalyzer(
+            etherscan_key=os.getenv("ETHERSCAN_API_KEY", "AW8AJ3TQV79VTM1WM9KY7W9H5ICZZ1WUYT"),
+            infura_url=os.getenv("INFURA_URL", "https://mainnet.infura.io/v3/e1576449bd6142eba99fd3cc4f3fe7b3")
+        )
+        self.watchlist = {}  # chat_id → [addresses]
 
         log.info("🤖 AnalyticsBot (All-in-One) initialized")
 
@@ -267,21 +419,28 @@ Use /plans to see pricing & subscribe!
         has_sub  = self.db.is_active(chat_id)
 
         msg = """
-🤖 *Contract Analytics Bot*
+🤖 *Rizal Crypto Bot — All-in-One*
 ━━━━━━━━━━━━━━━━━━━━━━
 
 🆓 *Free Commands:*
 /start — Welcome & status
-/plans — See subscription plans
-/subscribe `<plan>` — Subscribe (basic/pro/premium)
-/confirm `<tx_hash>` — Confirm USDT payment
-/status — Check your subscription
-/renew — Renew current plan
+/plans — Subscription plans
+/subscribe `<plan>` — Subscribe
+/confirm `<tx_hash>` — Confirm payment
+/status — Check subscription
+/renew — Renew plan
 
-📊 *Analytics Commands* _(subscribers only)_:
-/analyze `<address>` — Analyze any contract
+💼 *Portfolio Tracker* _(subscribers only)_:
+/track `<address>` — Analisis portfolio wallet
+/watch `<address>` — Tambah ke watchlist
+/watchlist — Lihat semua wallet di watchlist
+/unwatch `<address>` — Hapus dari watchlist
+/refresh — Refresh semua watchlist
+
+📊 *Contract Analytics* _(subscribers only)_:
+/analyze `<address>` — Analisis smart contract
 /preset — List preset contracts
-/use `<name>` — Use preset contract
+/use `<name>` — Gunakan preset
 /report `[days]` — Full analytics report
 /top `[n]` — Top N callers
 /trend — 24h vs 7d trend
@@ -292,7 +451,7 @@ Use /plans to see pricing & subscribe!
             msg += """
 
 👑 *Admin Commands:*
-/admin_list — All subscribers
+/admin_list — Semua subscribers
 /admin_stats — Revenue dashboard
 /admin_approve `<id>` — Approve payment
 /admin_reject `<id>` — Reject payment
@@ -555,6 +714,124 @@ Use /renew to extend anytime!
         """.strip())
 
     # ─────────────────────────────────────────
+    # PORTFOLIO TRACKER COMMANDS
+    # ─────────────────────────────────────────
+    def _send_portfolio_report(self, chat_id: str, data: dict):
+        summary = data["summary"]
+        eth     = data["eth"]
+        tokens  = data["tokens"][:5]
+        nfts    = data["nfts"][:3]
+        addr    = data["address"]
+
+        msg = f"""
+💼 *PORTFOLIO TRACKER*
+━━━━━━━━━━━━━━━━━━━━━━
+👛 `{addr[:6]}...{addr[-4:]}`
+⏰ {data['timestamp'][:19]}
+
+💰 *Total: ${summary['total_value_usd']:,.2f}*
+━━━━━━━━━━━━━━━━━━━━━━
+🔷 *ETH*
+• Balance : `{eth['balance']} ETH`
+• Price   : `${eth['price_usd']:,.2f}`
+• Value   : `${eth['value_usd']:,.2f}`
+        """.strip()
+
+        if tokens:
+            msg += "\n\n🪙 *Top Tokens*"
+            for t in tokens:
+                val = t.get("value_usd", 0)
+                if val > 0:
+                    msg += f"\n• {t['symbol']}: `{t['balance']}` (~`${val:,.2f}`)"
+                else:
+                    msg += f"\n• {t['symbol']}: `{t['balance']}`"
+
+        if nfts:
+            msg += f"\n\n🖼️ *NFTs ({len(data['nfts'])} total)*"
+            for n in nfts:
+                msg += f"\n• {n['name']} #{n['token_id']}"
+
+        msg += f"""
+
+━━━━━━━━━━━━━━━━━━━━━━
+📊 *Breakdown*
+• ETH    : `${summary['eth_value']:,.2f}`
+• Tokens : `${summary['token_value']:,.2f}` ({summary['token_count']} tokens)
+• NFTs   : `{summary['nft_count']} items`
+        """
+        self.send(chat_id, msg.strip())
+
+    def cmd_track(self, chat_id: str, args: list):
+        if not self.require_sub(chat_id): return
+        if not args:
+            self.send(chat_id, "⚠️ Usage: `/track 0x...`")
+            return
+        address = args[0].strip()
+        if not address.startswith("0x") or len(address) != 42:
+            self.send(chat_id, "❌ Address tidak valid.")
+            return
+        self.send(chat_id, f"🔍 Menganalisis portfolio...\n`{address}`\n⏳ Mohon tunggu ~30 detik...")
+        try:
+            data = self.portfolio_analyzer.analyze(address)
+            self._send_portfolio_report(chat_id, data)
+        except Exception as e:
+            self.send(chat_id, f"❌ Error: `{str(e)[:200]}`")
+
+    def cmd_watch(self, chat_id: str, args: list):
+        if not self.require_sub(chat_id): return
+        if not args:
+            self.send(chat_id, "⚠️ Usage: `/watch 0x...`")
+            return
+        address = args[0].strip()
+        if chat_id not in self.watchlist:
+            self.watchlist[chat_id] = []
+        if address not in self.watchlist[chat_id]:
+            self.watchlist[chat_id].append(address)
+            self.send(chat_id, f"✅ `{address[:10]}...` ditambahkan ke watchlist!\nAuto-refresh setiap 60 menit.")
+        else:
+            self.send(chat_id, "⚠️ Address sudah ada di watchlist.")
+
+    def cmd_watchlist(self, chat_id: str):
+        if not self.require_sub(chat_id): return
+        wl = self.watchlist.get(chat_id, [])
+        if not wl:
+            self.send(chat_id, "📭 Watchlist kosong.\nGunakan `/watch <address>` untuk menambahkan.")
+            return
+        lines = ["👀 *Watchlist*\n━━━━━━━━━━━━━━━━━━━━━━"]
+        for i, addr in enumerate(wl, 1):
+            lines.append(f"{i}. `{addr[:10]}...{addr[-4:]}`")
+        self.send(chat_id, "\n".join(lines))
+
+    def cmd_unwatch(self, chat_id: str, args: list):
+        if not self.require_sub(chat_id): return
+        if not args:
+            self.send(chat_id, "⚠️ Usage: `/unwatch 0x...`")
+            return
+        address = args[0].strip()
+        wl = self.watchlist.get(chat_id, [])
+        if address in wl:
+            wl.remove(address)
+            self.watchlist[chat_id] = wl
+            self.send(chat_id, f"✅ `{address[:10]}...` dihapus dari watchlist.")
+        else:
+            self.send(chat_id, "❌ Address tidak ditemukan di watchlist.")
+
+    def cmd_refresh(self, chat_id: str):
+        if not self.require_sub(chat_id): return
+        wl = self.watchlist.get(chat_id, [])
+        if not wl:
+            self.send(chat_id, "📭 Watchlist kosong.")
+            return
+        self.send(chat_id, f"🔄 Refreshing {len(wl)} wallet...")
+        for address in wl:
+            try:
+                data = self.portfolio_analyzer.analyze(address)
+                self._send_portfolio_report(chat_id, data)
+                time.sleep(2)
+            except Exception as e:
+                self.send(chat_id, f"❌ Error `{address[:10]}...`: `{str(e)[:100]}`")
+
+    # ─────────────────────────────────────────
     # ADMIN COMMANDS
     # ─────────────────────────────────────────
     def cmd_admin_approve(self, chat_id: str, args: list):
@@ -670,6 +947,13 @@ Use /renew to extend anytime!
         elif command == "/confirm":            self.cmd_confirm(chat_id, username, args)
         elif command == "/status":             self.cmd_status(chat_id)
         elif command == "/renew":              self.cmd_renew(chat_id, username)
+
+        # Portfolio tracker (subscribers only)
+        elif command == "/track":      self.cmd_track(chat_id, args)
+        elif command == "/watch":      self.cmd_watch(chat_id, args)
+        elif command == "/watchlist":  self.cmd_watchlist(chat_id)
+        elif command == "/unwatch":    self.cmd_unwatch(chat_id, args)
+        elif command == "/refresh":    self.cmd_refresh(chat_id)
 
         # Analytics (subscribers only)
         elif command == "/analyze":  self.cmd_analyze(chat_id, args)
