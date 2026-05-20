@@ -1,0 +1,16 @@
+{
+  "subscribers": {},
+  "pending": {
+    "1024188205": {
+      "chat_id": "1024188205",
+      "username": "i_ZALLL",
+      "plan": "basic",
+      "requested_at": "2026-05-17T17:21:09.099481",
+      "amount": 10
+    }
+  },
+  "stats": {
+    "total_revenue": 0,
+    "total_subscribers": 0
+  }
+}

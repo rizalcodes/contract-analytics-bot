@@ -44,7 +44,7 @@ except Exception as e:
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-TELEGRAM_TOKEN   = "8660442841:AAE1oCT6WkyhVdE9eC46I-YOD-FNBjeomYY"
+TELEGRAM_TOKEN   = "8660442841:AAE1oCT6WkyhVdE9eC46I-YOD-FNBjeomYY"  
 ADMIN_CHAT_ID    = "1024188205"   # Rizal — admin only
 USDT_TRC20       = "TNxivKGm18XCYtgM2TMewNompRnBqfPjFY"
 
