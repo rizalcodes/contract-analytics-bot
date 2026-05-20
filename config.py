@@ -53,18 +53,18 @@ ANOMALY_MAX_ALERT = 3     # max alert per cycle biar tidak spam
 # ─────────────────────────────────────────────
 def validate():
     missing = []
-    if not ETHERSCAN_API_KEY: missing.append("AW8AJ3TQV79VTM1WM9KY7W9H5ICZZ1WUYT")
-    if not INFURA_URL:         missing.append("https://mainnet.infura.io/v3/e1576449bd6142eba99fd3cc4f3fe7b3")
-    if not TELEGRAM_TOKEN:     missing.append("8660442841:AAEOXjIzvJA3xSKh0DHi_V9jLXeEshO2L2k")
+    if not ETHERSCAN_API_KEY: missing.append("Your_Etherscan_Api_Here")
+    if not INFURA_URL:         missing.append("https://mainnet.infura.io/v3/Your_Infure_Key_Here")
+    if not TELEGRAM_TOKEN:     missing.append("Your_Telegram_Bot_Token_Here")
 
     if missing:
         print("⚠️  Environment variables belum di-set:")
         for m in missing:
             print(f"   - {m}")
         print("\nCara set di PowerShell:")
-        print('   $env:ETHERSCAN_API_KEY = "AW8AJ3TQV79VTM1WM9KY7W9H5ICZZ1WUYT"')
-        print('   $env:INFURA_URL        = "https://mainnet.infura.io/v3/e1576449bd6142eba99fd3cc4f3fe7b3"')
-        print('   $env:TELEGRAM_TOKEN    = "8660442841:AAEOXjIzvJA3xSKh0DHi_V9jLXeEshO2L2k"')
+        print('   $env:ETHERSCAN_API_KEY = "Your_Etherscan_Api_Here"')
+        print('   $env:INFURA_URL        = "https://mainnet.infura.io/v3/Your_Infure_Key_Here"')
+        print('   $env:TELEGRAM_TOKEN    = "Your_Telegram_Bot_Token_Here"')
         return False
     return True
 
