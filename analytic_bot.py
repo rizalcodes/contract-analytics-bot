@@ -10,7 +10,7 @@ import json
 import time
 import logging
 import requests
-import threading 
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import Counter
@@ -31,10 +31,12 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 try:
     import importlib
-    ca = importlib.import_module("contract-analytics")
+    import sys
+    sys.path.insert(0, r"C:\Users\Administrator\Documents\contract_analytics.py")
+    ca = importlib.import_module("contract_analytics")
     ContractAnalytics = ca.ContractAnalytics
     TelegramNotifier  = ca.TelegramNotifier
-    log.info("✅ contract-analytics imported")
+    log.info("✅ contract_analytics imported")
 except Exception as e:
     log.warning(f"contract-analytics not found: {e}")
     ContractAnalytics = None
@@ -44,8 +46,8 @@ except Exception as e:
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-TELEGRAM_TOKEN   = "Your_Telegram_Bot_Token_Here"  
-ADMIN_CHAT_ID    = "Your_Chat_ID_Here"   # Rizal — admin only
+TELEGRAM_TOKEN   = "8660442841:AAE1oCT6WkyhVdE9eC46I-YOD-FNBjeomYY"
+ADMIN_CHAT_ID    = "1024188205"   # Rizal — admin only
 USDT_TRC20       = "TNxivKGm18XCYtgM2TMewNompRnBqfPjFY"
 
 PRESET_CONTRACTS = {
@@ -71,6 +73,34 @@ PLANS = {
 }
 
 DB_FILE = "subscribers.json"
+
+# ─────────────────────────────────────────────
+# MEV CONFIG
+# ─────────────────────────────────────────────
+KNOWN_MEV_BOTS = {
+    "0x00000000003b3cc22af3ae1eac0440bcee416b40": "MEV Bot (Generalized)",
+    "0x000000000035b5e5ad9019092c665357240f594d": "MEV Bot (Sandwich)",
+    "0xae2fc483527b8ef99eb5d9b44875f005ba1fae13": "Jaredfromsubway.eth",
+    "0x6b75d8af000000e20b7a7ddf000ba900b4009a80": "MEV Bot (Arbitrage)",
+}
+
+DEX_ROUTERS = {
+    "0x7a250d5630b4cf539739df2c5dacb4c659f2488d": "Uniswap V2",
+    "0xe592427a0aece92de3edee1f18e0157c05861564": "Uniswap V3",
+    "0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f": "SushiSwap",
+    "0x1111111254eeb25477b68fb85ed929f73a960582": "1inch V5",
+}
+
+MEV_SELECTORS = {
+    "0x7ff36ab5": "swapExactETHForTokens",
+    "0x18cbafe5": "swapExactTokensForETH",
+    "0x38ed1739": "swapExactTokensForTokens",
+    "0xfb3bdb41": "swapETHForExactTokens",
+    "0x414bf389": "exactInputSingle (V3)",
+}
+
+MIN_GAS_PREMIUM = 1.5
+SANDWICH_WINDOW = 3
 
 
 # ─────────────────────────────────────────────
@@ -326,6 +356,97 @@ class SubscriberDB:
 
 
 # ─────────────────────────────────────────────
+# MEV ANALYZER
+# ─────────────────────────────────────────────
+class MEVAnalyzer:
+    def __init__(self, w3: Web3):
+        self.w3 = w3
+
+    def scan_block(self, block_number: int) -> dict:
+        log.info(f"🎯 MEV scan block #{block_number}...")
+        try:
+            block = self.w3.eth.get_block(block_number, full_transactions=True)
+        except Exception as e:
+            return {"error": str(e)}
+
+        txs        = [dict(tx) for tx in block.get("transactions", [])]
+        dex_txs    = []
+
+        for tx in txs:
+            to_addr    = (tx.get("to") or "").lower()
+            input_data = tx.get("input", "0x")
+            selector   = input_data[:10] if len(input_data) >= 10 else "0x"
+            if to_addr in DEX_ROUTERS and selector in MEV_SELECTORS:
+                dex_txs.append({
+                    "hash"     : tx.get("hash", "").hex() if hasattr(tx.get("hash",""), "hex") else str(tx.get("hash","")),
+                    "from"     : (tx.get("from") or "").lower(),
+                    "to"       : to_addr,
+                    "dex"      : DEX_ROUTERS.get(to_addr, "Unknown"),
+                    "function" : MEV_SELECTORS.get(selector, "unknown"),
+                    "gas_price": int(tx.get("gasPrice", 0)),
+                    "value"    : int(tx.get("value", 0)),
+                    "selector" : selector,
+                    "index"    : txs.index(tx),
+                })
+
+        # Detect sandwiches
+        sandwiches = []
+        from collections import defaultdict
+        sender_txs = defaultdict(list)
+        for tx in dex_txs:
+            sender_txs[tx["from"]].append(tx)
+
+        for sender, stxs in sender_txs.items():
+            if len(stxs) >= 2:
+                for i in range(len(stxs) - 1):
+                    t1, t2 = stxs[i], stxs[i+1]
+                    if 1 <= t2["index"] - t1["index"] <= SANDWICH_WINDOW + 1:
+                        victims = [t for t in dex_txs if t1["index"] < t["index"] < t2["index"] and t["from"] != sender]
+                        if victims:
+                            sandwiches.append({
+                                "type"        : "SANDWICH",
+                                "attacker"    : sender,
+                                "front_tx"    : t1["hash"],
+                                "back_tx"     : t2["hash"],
+                                "victims"     : len(victims),
+                                "dex"         : t1["dex"],
+                                "is_known_bot": sender in KNOWN_MEV_BOTS,
+                                "bot_label"   : KNOWN_MEV_BOTS.get(sender, "Unknown"),
+                                "severity"    : "HIGH" if sender in KNOWN_MEV_BOTS else "MEDIUM",
+                            })
+
+        # Detect known bot arbitrage
+        arbitrages = []
+        for tx in dex_txs:
+            if tx["from"] in KNOWN_MEV_BOTS:
+                arbitrages.append({
+                    "type"     : "ARBITRAGE",
+                    "tx_hash"  : tx["hash"],
+                    "bot"      : tx["from"],
+                    "bot_label": KNOWN_MEV_BOTS[tx["from"]],
+                    "dex"      : tx["dex"],
+                    "function" : tx["function"],
+                    "severity" : "HIGH",
+                })
+
+        total = len(sandwiches) + len(arbitrages)
+        return {
+            "block_number": block_number,
+            "timestamp"   : datetime.now().isoformat(),
+            "total_txs"   : len(txs),
+            "dex_txs"     : len(dex_txs),
+            "mev_count"   : total,
+            "sandwiches"  : sandwiches,
+            "arbitrages"  : arbitrages,
+            "summary"     : {
+                "sandwich_count" : len(sandwiches),
+                "arbitrage_count": len(arbitrages),
+                "high_severity"  : sum(1 for m in sandwiches+arbitrages if m.get("severity")=="HIGH"),
+            }
+        }
+
+
+# ─────────────────────────────────────────────
 # MAIN BOT
 # ─────────────────────────────────────────────
 class AnalyticsBot:
@@ -348,6 +469,12 @@ class AnalyticsBot:
             infura_url=os.getenv("INFURA_URL", "https://mainnet.infura.io/v3/e1576449bd6142eba99fd3cc4f3fe7b3")
         )
         self.watchlist = {}  # chat_id → [addresses]
+
+        # MEV detector state
+        self.mev_w3       = Web3(Web3.HTTPProvider(os.getenv("INFURA_URL", "https://mainnet.infura.io/v3/e1576449bd6142eba99fd3cc4f3fe7b3")))
+        self.mev_analyzer = MEVAnalyzer(self.mev_w3)
+        self.mev_monitoring = False
+        self.mev_last_block = 0
 
         log.info("🤖 AnalyticsBot (All-in-One) initialized")
 
@@ -416,49 +543,54 @@ Use /plans to see pricing & subscribe!
 
     def cmd_help(self, chat_id: str):
         is_admin = self.db.is_admin(chat_id)
-        has_sub  = self.db.is_active(chat_id)
 
         msg = """
-🤖 *Rizal Crypto Bot — All-in-One*
+🤖 <b>Rizal Crypto Bot — All-in-One</b>
 ━━━━━━━━━━━━━━━━━━━━━━
 
-🆓 *Free Commands:*
-/start — Welcome & status
+🆓 <b>Free Commands:</b>
+/start — Welcome &amp; status
 /plans — Subscription plans
-/subscribe `<plan>` — Subscribe
-/confirm `<tx_hash>` — Confirm payment
+/subscribe — Subscribe (basic/pro/premium)
+/confirm — Confirm payment
 /status — Check subscription
 /renew — Renew plan
 
-💼 *Portfolio Tracker* _(subscribers only)_:
-/track `<address>` — Analisis portfolio wallet
-/watch `<address>` — Tambah ke watchlist
-/watchlist — Lihat semua wallet di watchlist
-/unwatch `<address>` — Hapus dari watchlist
-/refresh — Refresh semua watchlist
+💼 <b>Portfolio Tracker</b> (subscribers only):
+/track — Analisis portfolio wallet
+/watch — Tambah ke watchlist
+/watchlist — Lihat watchlist
+/unwatch — Hapus dari watchlist
+/refresh — Refresh watchlist
 
-📊 *Contract Analytics* _(subscribers only)_:
-/analyze `<address>` — Analisis smart contract
+📊 <b>Contract Analytics</b> (subscribers only):
+/analyze — Analisis smart contract
 /preset — List preset contracts
-/use `<name>` — Gunakan preset
-/report `[days]` — Full analytics report
-/top `[n]` — Top N callers
+/use — Gunakan preset
+/report — Full analytics report
+/top — Top N callers
 /trend — 24h vs 7d trend
-/alert `<on/off>` — Toggle anomaly alerts
+/alert — Toggle anomaly alerts
+
+🎯 <b>MEV Detector</b> (subscribers only):
+/mev — Scan block untuk MEV
+/mev_latest — Scan block terbaru
+/mev_monitor — Auto monitor MEV
+/mev_bots — List known MEV bots
         """.strip()
 
         if is_admin:
             msg += """
 
-👑 *Admin Commands:*
+👑 <b>Admin Commands:</b>
 /admin_list — Semua subscribers
 /admin_stats — Revenue dashboard
-/admin_approve `<id>` — Approve payment
-/admin_reject `<id>` — Reject payment
-/admin_revoke `<id>` — Cancel subscription
-/admin_extend `<id> <days>` — Extend subscription"""
+/admin_approve — Approve payment
+/admin_reject — Reject payment
+/admin_revoke — Cancel subscription
+/admin_extend — Extend subscription"""
 
-        self.send(chat_id, msg)
+        self.send(chat_id, msg, parse_mode="HTML")
 
     def cmd_plans(self, chat_id: str):
         msg = "💎 *Subscription Plans*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -832,6 +964,91 @@ Use /renew to extend anytime!
                 self.send(chat_id, f"❌ Error `{address[:10]}...`: `{str(e)[:100]}`")
 
     # ─────────────────────────────────────────
+    # MEV DETECTOR COMMANDS
+    # ─────────────────────────────────────────
+    def cmd_mev_scan(self, chat_id: str, args: list):
+        if not self.require_sub(chat_id): return
+        try:
+            block_num = int(args[0]) if args else self.mev_w3.eth.block_number
+        except ValueError:
+            self.send(chat_id, "❌ Block number harus angka!")
+            return
+
+        self.send(chat_id, f"🎯 Scanning block `#{block_num}` untuk MEV...\n⏳ Mohon tunggu ~15 detik...")
+        try:
+            result = self.mev_analyzer.scan_block(block_num)
+            if result.get("error"):
+                self.send(chat_id, f"❌ Error: `{result['error']}`")
+                return
+
+            summary = result["summary"]
+            msg = f"""
+🎯 *MEV SCAN — Block #{block_num}*
+━━━━━━━━━━━━━━━━━━━━━━
+📦 Total TXs   : `{result['total_txs']}`
+🔄 DEX TXs     : `{result['dex_txs']}`
+⚡ MEV Found   : `{result['mev_count']}`
+
+🥪 Sandwiches  : `{summary['sandwich_count']}`
+💱 Arbitrages  : `{summary['arbitrage_count']}`
+🔴 High Risk   : `{summary['high_severity']}`
+            """.strip()
+            self.send(chat_id, msg)
+
+            # Detail sandwiches
+            for s in result["sandwiches"][:3]:
+                sev = "🔴" if s["severity"] == "HIGH" else "🟡"
+                known = f"\n⚠️ Known: `{s['bot_label']}`" if s["is_known_bot"] else ""
+                self.send(chat_id, f"""
+{sev} *SANDWICH ATTACK*
+👤 Attacker: `{s['attacker'][:10]}...`
+🏊 DEX: `{s['dex']}`
+🎯 Victims: `{s['victims']}`{known}
+                """.strip())
+
+            # Detail arbitrages
+            for a in result["arbitrages"][:3]:
+                self.send(chat_id, f"""
+🔴 *ARBITRAGE — {a['bot_label']}*
+🤖 Bot: `{a['bot'][:10]}...`
+🏊 DEX: `{a['dex']}`
+🔧 Fn: `{a['function']}`
+                """.strip())
+
+            if result["mev_count"] == 0:
+                self.send(chat_id, "✅ Tidak ada MEV terdeteksi di block ini.")
+
+        except Exception as e:
+            self.send(chat_id, f"❌ Error: `{str(e)[:200]}`")
+
+    def cmd_mev_latest(self, chat_id: str):
+        if not self.require_sub(chat_id): return
+        block_num = self.mev_w3.eth.block_number
+        self.cmd_mev_scan(chat_id, [str(block_num)])
+
+    def cmd_mev_monitor(self, chat_id: str, args: list):
+        if not self.require_sub(chat_id): return
+        if not args:
+            status = "ON ✅" if self.mev_monitoring else "OFF ❌"
+            self.send(chat_id, f"📡 MEV Monitor: *{status}*\nGunakan `/mev_monitor on` atau `/mev_monitor off`")
+            return
+
+        if args[0].lower() == "on":
+            self.mev_monitoring  = True
+            self.mev_last_block  = self.mev_w3.eth.block_number
+            self.send(chat_id, f"✅ *MEV Monitor ON*\nMemantau dari block `#{self.mev_last_block}`")
+        elif args[0].lower() == "off":
+            self.mev_monitoring = False
+            self.send(chat_id, "❌ *MEV Monitor OFF*")
+
+    def cmd_mev_bots(self, chat_id: str):
+        if not self.require_sub(chat_id): return
+        lines = ["🤖 *Known MEV Bots*\n━━━━━━━━━━━━━━━━━━━━━━"]
+        for addr, label in KNOWN_MEV_BOTS.items():
+            lines.append(f"• `{addr[:10]}...` — {label}")
+        self.send(chat_id, "\n".join(lines))
+
+    # ─────────────────────────────────────────
     # ADMIN COMMANDS
     # ─────────────────────────────────────────
     def cmd_admin_approve(self, chat_id: str, args: list):
@@ -925,6 +1142,27 @@ Use /renew to extend anytime!
             except Exception as e:
                 log.error(f"Background error: {e}")
 
+    def _mev_background(self):
+        """Background thread untuk auto MEV monitoring."""
+        while self.running:
+            if self.mev_monitoring:
+                try:
+                    current = self.mev_w3.eth.block_number
+                    if current > self.mev_last_block:
+                        result = self.mev_analyzer.scan_block(current)
+                        if result.get("mev_count", 0) > 0:
+                            summary = result["summary"]
+                            self.send(ADMIN_CHAT_ID, f"""
+🎯 *MEV DETECTED — Block #{current}*
+🥪 Sandwiches: `{summary['sandwich_count']}`
+💱 Arbitrages: `{summary['arbitrage_count']}`
+🔴 High Risk : `{summary['high_severity']}`
+                            """.strip())
+                        self.mev_last_block = current
+                except Exception as e:
+                    log.error(f"MEV monitor error: {e}")
+            time.sleep(12)  # ~1 Ethereum block
+
     # ─────────────────────────────────────────
     # MESSAGE ROUTER
     # ─────────────────────────────────────────
@@ -964,6 +1202,12 @@ Use /renew to extend anytime!
         elif command == "/trend":    self.cmd_trend(chat_id)
         elif command == "/alert":    self.cmd_alert(chat_id, args)
 
+        # MEV detector (subscribers only)
+        elif command == "/mev":          self.cmd_mev_scan(chat_id, args)
+        elif command == "/mev_latest":   self.cmd_mev_latest(chat_id)
+        elif command == "/mev_monitor":  self.cmd_mev_monitor(chat_id, args)
+        elif command == "/mev_bots":     self.cmd_mev_bots(chat_id)
+
         # Admin only
         elif command == "/admin_approve": self.cmd_admin_approve(chat_id, args)
         elif command == "/admin_reject":  self.cmd_admin_reject(chat_id, args)
@@ -980,8 +1224,9 @@ Use /renew to extend anytime!
     # ─────────────────────────────────────────
     def run(self):
         log.info("🚀 All-in-One Bot started!")
-        self.send(ADMIN_CHAT_ID, "🤖 *Analytics + Subscription Bot Online!*\n\nUse /admin_list to manage subscribers.")
+        self.send(ADMIN_CHAT_ID, "🤖 *Analytics + Subscription + Portfolio + MEV Bot Online!*\n\nUse /admin_list to manage subscribers.")
         threading.Thread(target=self._background, daemon=True).start()
+        threading.Thread(target=self._mev_background, daemon=True).start()
 
         while self.running:
             try:

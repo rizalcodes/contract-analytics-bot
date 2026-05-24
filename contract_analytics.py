@@ -290,6 +290,7 @@ class ContractAnalytics:
     def analyze_usage(self, days_back: int = 7) -> dict:
         """Analisis pola penggunaan contract dalam N hari."""
         log.info(f"🔍 Analyzing usage for last {days_back} days...")
+        time.sleep(1)
         txs = self.etherscan.get_contract_txs(self.address, days_back)
 
         if not txs:
