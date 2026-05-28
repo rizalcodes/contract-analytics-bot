@@ -1,7 +1,7 @@
 """
-analytic_bot.py - Contract Analytics + Subscription + Portfolio Tracker Bot
+analytic_bot.py - Contract Analytics + Subscription + Portfolio Tracker + MEV Detector + DeFi Yield Bot
 Web3 Python Toolkit by Rizal
-All-in-one: analytics + subscription/payment + portfolio tracking
+All-in-one: analytics + subscription + portfolio + MEV + yield aggregator
 """
 
 import os
@@ -447,6 +447,90 @@ class MEVAnalyzer:
 
 
 # ─────────────────────────────────────────────
+# DEFI YIELD AGGREGATOR
+# ─────────────────────────────────────────────
+class YieldAggregator:
+    """Aggregate & rank yields dari Aave, Compound, Curve, Uniswap V3."""
+
+    def __init__(self):
+        self.session   = requests.Session()
+        self._cache    = []
+        self._cache_ts = 0
+
+    def _get_defillama(self, project: str, chain: str = "Ethereum") -> list:
+        """Generic fetch dari DeFi Llama yields API."""
+        try:
+            r = self.session.get("https://yields.llama.fi/pools", timeout=15)
+            pools = r.json().get("data", [])
+            results = []
+            for pool in pools:
+                if project.lower() in pool.get("project","").lower() and pool.get("chain") == chain:
+                    apy = float(pool.get("apy", 0))
+                    tvl = float(pool.get("tvlUsd", 0))
+                    if tvl > 500000 and apy > 0:
+                        results.append({
+                            "protocol"  : pool.get("project","").replace("-", " ").title(),
+                            "asset"     : pool.get("symbol",""),
+                            "supply_apy": round(apy, 2),
+                            "borrow_apy": round(float(pool.get("apyBorrow") or 0), 2),
+                            "tvl_usd"   : round(tvl, 0),
+                            "type"      : "lending" if "aave" in project or "compound" in project else "liquidity",
+                            "risk"      : "LOW" if "aave" in project or "compound" in project else "MEDIUM",
+                        })
+            return sorted(results, key=lambda x: x["supply_apy"], reverse=True)[:6]
+        except Exception as e:
+            log.error(f"DeFi Llama {project} error: {e}")
+            return []
+
+    def get_all_yields(self, use_cache: bool = True) -> list:
+        now = time.time()
+        if use_cache and self._cache and now - self._cache_ts < 600:
+            return self._cache
+
+        log.info("🔄 Fetching yield data from DeFi Llama...")
+        all_yields = []
+        for project in ["aave-v3", "compound", "curve-dex", "uniswap-v3"]:
+            all_yields.extend(self._get_defillama(project))
+            time.sleep(0.3)
+
+        all_yields     = sorted(all_yields, key=lambda x: x["supply_apy"], reverse=True)
+        self._cache    = all_yields
+        self._cache_ts = now
+        log.info(f"✅ Found {len(all_yields)} yield opportunities")
+        return all_yields
+
+    def get_best_yields(self, top_n: int = 10) -> list:
+        return self.get_all_yields()[:top_n]
+
+    def get_by_protocol(self, protocol: str) -> list:
+        return [y for y in self.get_all_yields() if protocol.lower() in y["protocol"].lower()]
+
+    def get_stable_yields(self) -> list:
+        stables = ["USDC", "USDT", "DAI", "FRAX", "BUSD", "LUSD"]
+        return [y for y in self.get_all_yields() if any(s in y["asset"].upper() for s in stables)]
+
+    def get_summary(self) -> dict:
+        all_yields = self.get_all_yields()
+        if not all_yields:
+            return {}
+        apys = [y["supply_apy"] for y in all_yields]
+        return {
+            "total"      : len(all_yields),
+            "highest_apy": max(apys),
+            "lowest_apy" : min(apys),
+            "avg_apy"    : round(sum(apys) / len(apys), 2),
+            "protocols"  : list(set(y["protocol"] for y in all_yields)),
+        }
+
+    def format_yield(self, y: dict, rank: int = 0) -> str:
+        rank_str   = f"{rank}. " if rank else "• "
+        risk_emoji = "🟢" if y["risk"] == "LOW" else "🟡"
+        tvl        = y["tvl_usd"]
+        tvl_str    = f"${tvl/1e9:.1f}B" if tvl > 1e9 else f"${tvl/1e6:.1f}M"
+        return f"{rank_str}*{y['protocol']}* — {y['asset']}\n   💰 APY: `{y['supply_apy']}%` {risk_emoji} | TVL: `{tvl_str}`"
+
+
+# ─────────────────────────────────────────────
 # MAIN BOT
 # ─────────────────────────────────────────────
 class AnalyticsBot:
@@ -475,6 +559,10 @@ class AnalyticsBot:
         self.mev_analyzer = MEVAnalyzer(self.mev_w3)
         self.mev_monitoring = False
         self.mev_last_block = 0
+
+        # DeFi Yield Aggregator state
+        self.yield_aggregator = YieldAggregator()
+        self.yield_alert_on   = False
 
         log.info("🤖 AnalyticsBot (All-in-One) initialized")
 
@@ -577,6 +665,16 @@ Use /plans to see pricing & subscribe!
 /mev_latest — Scan block terbaru
 /mev_monitor — Auto monitor MEV
 /mev_bots — List known MEV bots
+
+💰 <b>DeFi Yield Aggregator</b> (subscribers only):
+/yield — Best yield opportunities
+/yield_stable — Stablecoin yields only
+/yield_aave — Aave V3 rates
+/yield_compound — Compound rates
+/yield_curve — Curve pools
+/yield_uni — Uniswap V3 pools
+/yield_summary — Market overview
+/yield_alert — APY spike alerts
         """.strip()
 
         if is_admin:
@@ -1049,6 +1147,90 @@ Use /renew to extend anytime!
         self.send(chat_id, "\n".join(lines))
 
     # ─────────────────────────────────────────
+    # DEFI YIELD COMMANDS
+    # ─────────────────────────────────────────
+    def cmd_yield(self, chat_id: str, args: list = None):
+        if not self.require_sub(chat_id): return
+        self.send(chat_id, "🔄 Fetching best yields...\n⏳ Mohon tunggu ~10 detik...")
+        try:
+            yields = self.yield_aggregator.get_best_yields(10)
+            if not yields:
+                self.send(chat_id, "❌ Tidak ada data yield tersedia.")
+                return
+            msg = "💰 *BEST YIELD OPPORTUNITIES*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            for i, y in enumerate(yields, 1):
+                msg += self.yield_aggregator.format_yield(y, i) + "\n\n"
+            msg += f"🟢 LOW risk  🟡 MEDIUM risk\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            self.send(chat_id, msg)
+        except Exception as e:
+            self.send(chat_id, f"❌ Error: `{str(e)[:200]}`")
+
+    def cmd_yield_stable(self, chat_id: str):
+        if not self.require_sub(chat_id): return
+        self.send(chat_id, "🔄 Fetching stablecoin yields...")
+        try:
+            yields = self.yield_aggregator.get_stable_yields()
+            if not yields:
+                self.send(chat_id, "❌ Tidak ada data stablecoin yield.")
+                return
+            msg = "💵 *STABLECOIN YIELDS*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            for i, y in enumerate(yields[:8], 1):
+                msg += self.yield_aggregator.format_yield(y, i) + "\n\n"
+            self.send(chat_id, msg)
+        except Exception as e:
+            self.send(chat_id, f"❌ Error: `{str(e)[:200]}`")
+
+    def cmd_yield_protocol(self, chat_id: str, protocol: str):
+        if not self.require_sub(chat_id): return
+        self.send(chat_id, f"🔄 Fetching {protocol} yields...")
+        try:
+            yields = self.yield_aggregator.get_by_protocol(protocol)
+            if not yields:
+                self.send(chat_id, f"❌ Tidak ada data untuk {protocol}.")
+                return
+            msg = f"🏦 *{protocol.upper()} YIELDS*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            for i, y in enumerate(yields[:8], 1):
+                msg += self.yield_aggregator.format_yield(y, i) + "\n\n"
+            self.send(chat_id, msg)
+        except Exception as e:
+            self.send(chat_id, f"❌ Error: `{str(e)[:200]}`")
+
+    def cmd_yield_summary(self, chat_id: str):
+        if not self.require_sub(chat_id): return
+        self.send(chat_id, "🔄 Generating yield summary...")
+        try:
+            s = self.yield_aggregator.get_summary()
+            if not s:
+                self.send(chat_id, "❌ Tidak ada data summary.")
+                return
+            protocols = ", ".join(s["protocols"])
+            self.send(chat_id, f"""
+📊 *DEFI YIELD OVERVIEW*
+━━━━━━━━━━━━━━━━━━━━━━
+🏦 Protocols  : `{protocols}`
+📈 Highest APY: `{s['highest_apy']}%`
+📉 Lowest APY : `{s['lowest_apy']}%`
+📊 Average APY: `{s['avg_apy']}%`
+🔢 Total Opps : `{s['total']}`
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
+            """.strip())
+        except Exception as e:
+            self.send(chat_id, f"❌ Error: `{str(e)[:200]}`")
+
+    def cmd_yield_alert(self, chat_id: str, args: list):
+        if not self.require_sub(chat_id): return
+        if not args:
+            status = "ON ✅" if self.yield_alert_on else "OFF ❌"
+            self.send(chat_id, f"🔔 APY Alert: *{status}*\nGunakan `/yield_alert on` atau `/yield_alert off`")
+            return
+        if args[0].lower() == "on":
+            self.yield_alert_on = True
+            self.send(chat_id, "✅ *APY Alert ON*\nKamu akan dapat notif kalau ada APY spike > 20%!")
+        elif args[0].lower() == "off":
+            self.yield_alert_on = False
+            self.send(chat_id, "❌ *APY Alert OFF*")
+
+    # ─────────────────────────────────────────
     # ADMIN COMMANDS
     # ─────────────────────────────────────────
     def cmd_admin_approve(self, chat_id: str, args: list):
@@ -1207,6 +1389,16 @@ Use /renew to extend anytime!
         elif command == "/mev_latest":   self.cmd_mev_latest(chat_id)
         elif command == "/mev_monitor":  self.cmd_mev_monitor(chat_id, args)
         elif command == "/mev_bots":     self.cmd_mev_bots(chat_id)
+
+        # DeFi Yield (subscribers only)
+        elif command == "/yield":          self.cmd_yield(chat_id, args)
+        elif command == "/yield_stable":   self.cmd_yield_stable(chat_id)
+        elif command == "/yield_aave":     self.cmd_yield_protocol(chat_id, "aave")
+        elif command == "/yield_compound": self.cmd_yield_protocol(chat_id, "compound")
+        elif command == "/yield_curve":    self.cmd_yield_protocol(chat_id, "curve")
+        elif command == "/yield_uni":      self.cmd_yield_protocol(chat_id, "uniswap")
+        elif command == "/yield_summary":  self.cmd_yield_summary(chat_id)
+        elif command == "/yield_alert":    self.cmd_yield_alert(chat_id, args)
 
         # Admin only
         elif command == "/admin_approve": self.cmd_admin_approve(chat_id, args)
